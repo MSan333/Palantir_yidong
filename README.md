@@ -248,7 +248,7 @@ Foundry 架构：多源数据 → 本体对象 → 应用决策 → 操作闭环
 - Ontology Manager（业务模型定义，定义对象结构）
 - Data Lineage（数据血缘追踪）
 
-**重要说明**：第1层完成两件事：1) 通过 Data Connection 接入数据形成**数据集**；2) 通过 Ontology Manager 定义**业务对象模型**。真正将数据集映射为 Ontology 对象是在第2层完成的。
+**重要说明**：第1层完成两件事：1) 通过 Data Connection 接入数据形成**数据集**；2) 通过 Ontology Manager 定义**业务对象模型**。真正将数据集映射为 Ontology 对象是在**第2层的最后一步**完成的（Pipeline 输出节点配置映射）。
 
 #### **第 2 层：数据变换层（ETL）**
 
@@ -964,12 +964,118 @@ JOIN PRODUCT ON orders.product_id = product.id
 └─ trend_indicator = IF(total_amount > LAG(total_amount) OVER (ORDER BY date), '↑', '↓')（趋势）
 └─ 输出：365 行 + 3 个派生列
 
-【Step 7】Output: 生成本体数据集
+【Step 7】Output: 生成数据集
 输出数据集名称：orders_daily_summary
 ├─ 行数：365 行
 ├─ 字段：20 个（原始 + 聚合 + 派生）
 ├─ 更新频率：每天凌晨 2:00（参数化时间）
 └─ 压缩率：原始 50M → 最终 365 行（99.99% 压缩）
+
+【Step 8】**关键步骤：映射到 Ontology 对象**
+
+这是数据集转换为 Ontology 对象的**核心步骤**，在 Pipeline 的输出节点完成：
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Pipeline Builder - Output 节点配置                  │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│ 【第1步】点击 Pipeline 最后一个节点"Output"        │
+│ └─ 选择输出类型：☑ "Map to Ontology Object"       │
+│                                                     │
+│ 【第2步】选择或创建对象类型                         │
+│ ├─ 方式 A：选择已有对象类型                         │
+│ │  └─ 下拉选择：Order（在第1层 Ontology Manager 中已定义）
+│ │                                                   │
+│ ├─ 方式 B：从此 Pipeline 输出创建新对象类型         │
+│ │  ├─ 点击"Create Object Type from Output"        │
+│ │  ├─ 系统自动推断：                               │
+│ │  │  ├─ 主键：order_id (唯一性检测)              │
+│ │  │  ├─ 属性类型：自动识别 String/Double/DateTime │
+│ │  │  └─ 显示名称：自动生成                        │
+│ │  └─ 手动补充：                                   │
+│ │     ├─ 派生属性（isOverdue, isHighValue）       │
+│ │     ├─ 关系（→ Customer, → Product）            │
+│ │     └─ Actions（Assign, Cancel, Escalate）      │
+│ │                                                   │
+│ 【第3步】配置字段映射（Mapping）                    │
+│ ├─ 数据集字段 → Ontology 对象属性                  │
+│ │                                                   │
+│ │  Pipeline Output         Ontology Object          │
+│ │  ─────────────────────   ─────────────────────   │
+│ │  order_id         →      id (Primary Key)        │
+│ │  customer_segment →      customer (Link)         │
+│ │  total_amount     →      amount (Double)         │
+│ │  order_count      →      count (Integer)         │
+│ │  created_at       →      createdAt (DateTime)    │
+│ │  status           →      status (Enum)           │
+│ │  region           →      region (String)         │
+│ │  is_high_value    →      isHighValue (Boolean)   │
+│ │                                                   │
+│ 【第4步】配置关系映射（建立对象间关联）            │
+│ ├─ 关系1：Order → Customer (Many-to-One)           │
+│ │  ├─ 外键字段：customer_segment                   │
+│ │  ├─ 目标对象：Customer                           │
+│ │  ├─ 匹配字段：Customer.segment                   │
+│ │  └─ 关系名称：customer                           │
+│ │                                                   │
+│ ├─ 关系2：Order → Product (Many-to-Many)           │
+│ │  ├─ 通过连接表：order_items                      │
+│ │  ├─ 目标对象：Product                            │
+│ │  └─ 关系名称：products[]                         │
+│ │                                                   │
+│ 【第5步】配置 Actions（操作定义）                  │
+│ └─ Actions 在 Ontology Manager 中定义，不在 Pipeline│
+│    └─ 示例：Assign(分配), Cancel(取消), Escalate(升级)
+│                                                     │
+│ 【第6步】更新策略配置                               │
+│ ├─ 更新模式：UPSERT（有则更新，无则插入）          │
+│ ├─ 主键匹配：基于 order_id                         │
+│ ├─ 时间戳保留：createdAt 不更新（仅插入时设置）   │
+│ └─ 删除策略：软删除（标记为 DELETED）              │
+│                                                     │
+│ 【第7步】保存并运行 Pipeline                        │
+│ └─ 每次 Pipeline 运行时：                          │
+│    ├─ 处理数据集 → 输出到临时表                    │
+│    ├─ 自动执行映射逻辑                             │
+│    ├─ 更新 Ontology 对象实例                       │
+│    └─ 触发下游应用自动刷新（Workshop/Contour）    │
+└─────────────────────────────────────────────────────┘
+```
+
+**映射完成后的数据流**：
+
+```
+数据集（Dataset）
+├─ orders_daily_summary
+├─ 365 行 × 20 列
+└─ 技术格式：Parquet/Delta
+
+        ↓ 映射（Mapping）在 Pipeline Output 节点配置
+
+Ontology 对象（Order）
+├─ 365 个 Order 对象实例
+├─ 每个实例包含：
+│  ├─ 基础属性（id, amount, status...）
+│  ├─ 派生属性（isHighValue, performance_rating...）
+│  ├─ 关系（→ Customer, → Product[]）
+│  └─ 可执行操作（Assign, Cancel, Escalate）
+├─ 业务语言：订单、客户、金额
+└─ 支持权限、审计、操作
+
+        ↓ 被上层应用使用
+
+Workshop 应用 / Contour 分析 / AIP Agents
+└─ 直接操作 Order 对象，而非数据集
+```
+
+**关键理解**：
+
+1. **时间点**：映射发生在 **Pipeline 的最后一个输出节点**
+2. **地点**：在 **Pipeline Builder 的 Output 配置界面**
+3. **触发**：每次 Pipeline 运行时自动执行映射
+4. **关系**：在映射配置时通过外键字段建立
+5. **Actions**：必须先在 Ontology Manager 中定义，然后在 Workshop 等应用中使用
 
 【核心特性展示】
 
